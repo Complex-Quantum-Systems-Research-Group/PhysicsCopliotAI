@@ -132,6 +132,71 @@
     /* ── Config panel ── */
     .config-panel {
       flex: 1;
+      position: relative;
+      overflow: hidden;
+    }
+
+    #config-builder-frame {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: none;
+      display: block;
+      background: #f4f5fb;
+    }
+
+    /* Drawer toggle tab — anchored to left edge of config-panel */
+    .drawer-tab {
+      position: absolute;
+      left: 0;
+      top: 50%;
+      transform: translateY(-50%);
+      z-index: 20;
+      width: 22px;
+      height: 72px;
+      background: #4a6fa5;
+      border: none;
+      border-radius: 0 8px 8px 0;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      color: #fff;
+      font-size: 0.6rem;
+      padding: 0;
+    }
+    .drawer-tab:hover { background: #3a5a8a; }
+    .drawer-tab-chevron { font-size: 0.7rem; line-height: 1; }
+    .drawer-tab-badge {
+      background: #e74c3c;
+      border-radius: 50%;
+      width: 9px;
+      height: 9px;
+      flex-shrink: 0;
+    }
+
+    /* Sliding card drawer */
+    .card-drawer {
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: calc(100% - 22px);
+      height: 100%;
+      background: #f4f5fb;
+      box-shadow: -4px 0 18px rgba(0,0,0,0.12);
+      transform: translateX(100%);
+      transition: transform 0.25s ease;
+      z-index: 10;
+      overflow: hidden;
+    }
+    .card-drawer.open { transform: translateX(0); }
+
+    .card-drawer-body {
+      position: absolute;
+      inset: 0;
       overflow-y: auto;
       padding: 1.25rem;
       display: flex;
@@ -184,7 +249,8 @@
       padding: 1rem;
       overflow: auto;
       max-height: 340px;
-      white-space: pre;
+      white-space: pre-wrap;
+      word-break: break-word;
       margin: 0;
     }
 
@@ -259,6 +325,8 @@
       font-size: 0.78rem;
       color: #333;
       line-height: 1.7;
+      word-break: break-all;
+      overflow-wrap: anywhere;
     }
 
     .spinner {
@@ -276,6 +344,15 @@
     #obs-card { display: none; }
     #obs-results-card { display: none; }
 
+    /* ── Registry card ── */
+    #registry-card { display: none; }
+    .badge-registered { background: #e3fcef; color: #006644; }
+    .reg-info { padding: 0.85rem 1rem; font-size: 0.88rem; line-height: 1.8; color: #2a2d4a; }
+    .reg-row { display: flex; gap: 0.5rem; margin-bottom: 0.2rem; align-items: flex-start; flex-wrap: wrap; }
+    .reg-label { font-weight: 700; color: #6b6f8a; min-width: 110px; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; flex-shrink: 0; }
+    .reg-row > span:last-child { word-break: break-word; overflow-wrap: anywhere; min-width: 0; }
+    .btn-delete { background: #de350b; color: #fff; }
+
     .obs-config-display {
       padding: 0.85rem 1rem;
       font-size: 0.85rem;
@@ -286,6 +363,7 @@
       display: flex;
       gap: 0.5rem;
       margin-bottom: 0.2rem;
+      flex-wrap: wrap;
     }
     .obs-config-display .obs-label {
       font-weight: 700;
@@ -294,6 +372,12 @@
       font-size: 0.78rem;
       text-transform: uppercase;
       letter-spacing: 0.04em;
+      flex-shrink: 0;
+    }
+    .obs-config-display .obs-row > span:last-child {
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      min-width: 0;
     }
 
     .analysis-box {
@@ -355,61 +439,95 @@
   <!-- ── Config panel ── -->
   <div class="config-panel">
 
-    <div class="placeholder-msg" id="placeholder">
-      <strong>Config will appear here</strong>
-      Describe your simulation in the chat and Claude<br>will build the config for you to review.
-    </div>
+    <!-- Config builder iframe — lazy loaded on first open to avoid hitting Julia at startup -->
+    <iframe
+      id="config-builder-frame"
+      data-src="http://localhost:8080"
+      title="Config Builder"
+    ></iframe>
 
-    <!-- Config card -->
-    <div class="card" id="config-card">
-      <div class="card-header">Simulation Config</div>
-      <div class="summary-text" id="summary-text"></div>
-      <pre class="config-json" id="config-json"></pre>
-      <textarea id="edit-area" spellcheck="false"></textarea>
-      <div class="edit-error" id="edit-error"></div>
-      <div class="action-row">
-        <button class="btn btn-confirm"  id="btn-confirm"  onclick="confirmRun()">▶ Confirm &amp; Run</button>
-        <button class="btn btn-edit"     id="btn-edit"     onclick="startEdit()">✎ Edit</button>
-        <button class="btn btn-save"     id="btn-save"     onclick="saveEdit()">✔ Save</button>
-        <button class="btn btn-discard"  id="btn-discard"  onclick="discardEdit()">✕ Discard</button>
-        <button class="btn btn-cancel"   id="btn-cancel"   onclick="cancelConfig()">Cancel</button>
-      </div>
-    </div>
+    <!-- Drawer toggle tab — anchored to left edge -->
+    <button class="drawer-tab" id="drawer-tab" onclick="toggleDrawer()" title="Toggle cards panel">
+      <span class="drawer-tab-chevron" id="drawer-chevron">◀</span>
+      <span class="drawer-tab-badge" id="drawer-badge" style="display:none;"></span>
+    </button>
 
-    <!-- Observable config card -->
-    <div class="card" id="obs-card">
-      <div class="card-header">Observable Calculation</div>
-      <div class="summary-text" id="obs-summary-text"></div>
-      <div class="obs-config-display" id="obs-config-display"></div>
-      <div class="action-row">
-        <button class="btn btn-confirm" id="btn-obs-confirm" onclick="confirmObsRun()">▶ Confirm &amp; Calculate</button>
-        <button class="btn btn-cancel" onclick="cancelObs()">Cancel</button>
-      </div>
-    </div>
+    <!-- Sliding card drawer -->
+    <div class="card-drawer" id="card-drawer">
+      <div class="card-drawer-body">
 
-    <!-- Observable results card -->
-    <div class="card" id="obs-results-card">
-      <div class="card-header" id="obs-results-header">Observable Results</div>
-      <div id="obs-plot-container" style="padding: 0.75rem 0.5rem; min-height: 340px;"></div>
-      <div class="analysis-box" id="obs-analysis-box" style="display:none;"></div>
-      <div class="action-row">
-        <button class="btn btn-cancel" onclick="dismissObsResults()">✕ Dismiss</button>
-      </div>
-    </div>
-
-    <!-- Status card -->
-    <div class="card" id="status-card">
-      <div class="card-header">Pipeline Status</div>
-      <div class="status-inner">
-        <div class="status-row">
-          <span class="badge" id="status-badge"></span>
-          <span id="status-spinner"></span>
+        <div class="placeholder-msg" id="placeholder">
+          <strong>Config will appear here</strong>
+          Describe your simulation in the chat and Claude<br>will build the config for you to review.
         </div>
-        <div class="status-msg" id="status-msg"></div>
-        <div class="run-info" id="run-info"></div>
-      </div>
-      <div class="action-row" id="status-action-row" style="display:none;">
-        <button class="btn btn-cancel" onclick="dismissStatus()">✕ Dismiss</button>
+
+        <!-- Config card -->
+        <div class="card" id="config-card">
+          <div class="card-header">Simulation Config</div>
+          <div class="summary-text" id="summary-text"></div>
+          <pre class="config-json" id="config-json"></pre>
+          <textarea id="edit-area" spellcheck="false"></textarea>
+          <div class="edit-error" id="edit-error"></div>
+          <div class="action-row">
+            <button class="btn btn-confirm"  id="btn-confirm"  onclick="confirmRun()">▶ Confirm &amp; Run</button>
+            <button class="btn btn-edit"     id="btn-edit"     onclick="startEdit()">✎ Edit</button>
+            <button class="btn btn-save"     id="btn-save"     onclick="saveEdit()">✔ Save</button>
+            <button class="btn btn-discard"  id="btn-discard"  onclick="discardEdit()">✕ Discard</button>
+            <button class="btn btn-cancel"   id="btn-cancel"   onclick="cancelConfig()">Cancel</button>
+          </div>
+        </div>
+
+        <!-- Observable config card -->
+        <div class="card" id="obs-card">
+          <div class="card-header">Observable Calculation</div>
+          <div class="summary-text" id="obs-summary-text"></div>
+          <div class="obs-config-display" id="obs-config-display"></div>
+          <div class="action-row">
+            <button class="btn btn-confirm" id="btn-obs-confirm" onclick="confirmObsRun()">▶ Confirm &amp; Calculate</button>
+            <button class="btn btn-cancel" onclick="cancelObs()">Cancel</button>
+          </div>
+        </div>
+
+        <!-- Observable results card -->
+        <div class="card" id="obs-results-card">
+          <div class="card-header" id="obs-results-header">Observable Results</div>
+          <div id="obs-results-params" style="padding:0.3rem 1rem 0; font-size:0.75rem; color:#6b6f8a; font-family:monospace; word-break:break-word;"></div>
+          <div id="obs-plot-container" style="padding: 0.75rem 0.5rem; min-height: 340px;"></div>
+          <div class="analysis-box" id="obs-analysis-box" style="display:none;"></div>
+          <div class="action-row">
+            <button class="btn btn-cancel" onclick="dismissObsResults()">✕ Dismiss</button>
+            <button class="btn btn-confirm" onclick="downloadObsMetadata()" style="background:#4a6fa5;">⬇ Metadata</button>
+            <button class="btn btn-confirm" onclick="downloadObsNumpy()" style="background:#4a6fa5;">⬇ Numpy (.npz)</button>
+            <button class="btn btn-confirm" onclick="downloadObsPlot()" style="background:#4a6fa5;">⬇ Download Plot</button>
+          </div>
+        </div>
+
+        <!-- Registry card -->
+        <div class="card" id="registry-card">
+          <div class="card-header" id="registry-card-header">Registered</div>
+          <div class="reg-info" id="registry-info"></div>
+          <div class="action-row">
+            <button class="btn btn-delete" id="btn-reg-delete" onclick="deleteRegistration()">✕ Delete</button>
+            <button class="btn btn-cancel" onclick="dismissRegistryCard()">Dismiss</button>
+          </div>
+        </div>
+
+        <!-- Status card -->
+        <div class="card" id="status-card">
+          <div class="card-header">Pipeline Status</div>
+          <div class="status-inner">
+            <div class="status-row">
+              <span class="badge" id="status-badge"></span>
+              <span id="status-spinner"></span>
+            </div>
+            <div class="status-msg" id="status-msg"></div>
+            <div class="run-info" id="run-info"></div>
+          </div>
+          <div class="action-row" id="status-action-row" style="display:none;">
+            <button class="btn btn-cancel" onclick="dismissStatus()">✕ Dismiss</button>
+          </div>
+        </div>
+
       </div>
     </div>
 
@@ -425,6 +543,47 @@
   let pollTimer = null;
   let currentObsConfig = null;
   let obsPolTimer = null;
+  let lastRegisteredInfo = null;
+  let currentObsRunId = null;
+  let currentObsData = null;
+
+  // ── Drawer helpers ────────────────────────────────────────────────────────
+  function _loadBuilderIfNeeded() {
+    const frame = document.getElementById("config-builder-frame");
+    if (!frame.src || frame.src === window.location.href) {
+      frame.src = frame.dataset.src;  // load on first access only
+      frame.onload = function() {
+        if (_pendingBuilderConfig && frame.contentWindow) {
+          frame.contentWindow.postMessage(_pendingBuilderConfig, "*");
+          _pendingBuilderConfig = null;
+        }
+        frame.onload = null;
+      };
+    }
+  }
+  function openDrawer() {
+    document.getElementById("card-drawer").classList.add("open");
+    document.getElementById("drawer-chevron").textContent = "▶";
+  }
+  function closeDrawer() {
+    document.getElementById("card-drawer").classList.remove("open");
+    document.getElementById("drawer-chevron").textContent = "◀";
+    _loadBuilderIfNeeded();  // load iframe when drawer closes (builder becomes visible)
+  }
+  function toggleDrawer() {
+    if (document.getElementById("card-drawer").classList.contains("open")) {
+      closeDrawer();
+    } else {
+      _loadBuilderIfNeeded();  // also load if user manually opens and closes
+      openDrawer();
+    }
+  }
+  // Badge lights up when any active card is visible
+  function _updateBadge() {
+    const active = ["config-card","obs-card","obs-results-card","registry-card","status-card"]
+      .some(id => document.getElementById(id).style.display !== "none");
+    document.getElementById("drawer-badge").style.display = active ? "block" : "none";
+  }
 
   // ── Chat helpers ──────────────────────────────────────────────────────────
   // creates bubble for the message
@@ -463,6 +622,7 @@
     addBubble(text, "user");
     setThinking(true);
 
+
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
@@ -485,17 +645,46 @@
       if (data.config) {
         currentConfig = data.config;
         lastSubmittedConfig = data.config;
+        // New config replaces any existing obs or registry card
+        document.getElementById("obs-card").style.display = "none";
+        document.getElementById("obs-results-card").style.display = "none";
+        document.getElementById("registry-card").style.display = "none";
         showConfigCard(data.config, data.summary);
       }
 
       if (data.obs_config) {
         currentObsConfig = data.obs_config;
+        // New obs config replaces any existing sim config or registry card
+        document.getElementById("config-card").style.display = "none";
+        document.getElementById("registry-card").style.display = "none";
         showObsCard(data.obs_config, data.obs_summary);
       }
 
       if (data.show_obs_run_id) {
         addBubble("Loading observable results…", "info");
         await fetchAndRenderObsResults(data.show_obs_run_id);
+      }
+
+      if (data.tracking_id) {
+        document.getElementById("config-card").style.display = "none";
+        document.getElementById("obs-results-card").style.display = "none";
+        document.getElementById("placeholder").style.display = "none";
+        showStatusCard("queued", "Pipeline queued…");
+        document.getElementById("msg-input").disabled = true;
+        document.getElementById("send-btn").disabled = true;
+        startPolling(data.tracking_id);
+      }
+
+      if (data.obs_tracking_id) {
+        document.getElementById("obs-card").style.display = "none";
+        document.getElementById("placeholder").style.display = "none";
+        showStatusCard("queued", "Observable calculation queued…");
+        startObsPolling(data.obs_tracking_id);
+      }
+
+      if (data.registered) {
+        lastRegisteredInfo = data.registered;
+        showRegistryCard(data.registered);
       }
     } catch (e) {
       addBubble("Could not reach the server. Is it running on port 8000?", "info");
@@ -510,6 +699,10 @@
     document.getElementById("placeholder").style.display = "none";
     document.getElementById("status-card").style.display = "none";
     document.getElementById("config-card").style.display = "block";
+    openDrawer(); _updateBadge();
+
+    // Push config to the config builder iframe so both stay in sync
+    _pushConfigToBuilder(config, summary);
     document.getElementById("summary-text").textContent = summary || "Review the config below.";
     document.getElementById("config-json").textContent = JSON.stringify(config, null, 2);
 
@@ -531,6 +724,7 @@
     document.getElementById("status-card").style.display = "none";
     document.getElementById("status-action-row").style.display = "none";
     document.getElementById("run-info").style.display = "none";
+    _updateBadge();
   }
 
   // cancel config to not be sent to pipeline
@@ -539,6 +733,7 @@
     document.getElementById("config-card").style.display = "none";
     document.getElementById("placeholder").style.display = "block";
     addBubble("Config cancelled. What would you like to change?", "info");
+    _updateBadge();
   }
 
   // allows user to edit the config json manually if they would want to
@@ -614,6 +809,8 @@
       const data = await res.json();
 
       if (data.tracking_id) {
+        document.getElementById("config-card").style.display = "none";
+        document.getElementById("placeholder").style.display = "none";
         showStatusCard("queued", "Pipeline queued…");
         // Keep input locked while simulation runs and Claude interprets results
         document.getElementById("msg-input").disabled = true;
@@ -633,6 +830,7 @@
   // shows status of the run (queued, running, completed, failed)
   function showStatusCard(status, msg) {
     document.getElementById("status-card").style.display = "block";
+    openDrawer(); _updateBadge();
 
     const badge = document.getElementById("status-badge");
     badge.textContent = status;
@@ -690,7 +888,72 @@
         }
       } catch (_) { /* keep trying */ }
       finally { polling = false; }
-    }, 2000);
+    }, 5000);
+  }
+
+  // ── Registry card ─────────────────────────────────────────────────────────
+
+  function showRegistryCard(info) {
+    document.getElementById("placeholder").style.display = "none";
+    document.getElementById("config-card").style.display = "none";
+    document.getElementById("status-card").style.display = "none";
+    document.getElementById("obs-card").style.display = "none";
+    document.getElementById("obs-results-card").style.display = "none";
+    document.getElementById("registry-card").style.display = "block";
+    openDrawer(); _updateBadge();
+    document.getElementById("registry-card-header").textContent =
+      info.type === "model" ? "Model Registered" : "State Registered";
+
+    const rows = [
+      ["Name",         info.name],
+      ["Display Name", info.display_name],
+      ["System Type",  info.system_type],
+    ];
+    if (info.type === "model" && info.backend) {
+      rows.push(["Backend", info.backend === "tn" ? "Tensor Networks (TN)" : "Exact Diagonalization (ED)"]);
+    }
+
+    const rowsHtml = rows.map(([label, val]) =>
+      `<div class="reg-row"><span class="reg-label">${label}</span><span>${val}</span></div>`
+    ).join("");
+
+    document.getElementById("registry-info").innerHTML =
+      rowsHtml +
+      `<div class="reg-row" style="margin-top:0.4rem;">
+         <span class="badge badge-registered">&#10003; Registered</span>
+       </div>`;
+
+    document.getElementById("btn-reg-delete").disabled = false;
+  }
+
+  function dismissRegistryCard() {
+    lastRegisteredInfo = null;
+    document.getElementById("registry-card").style.display = "none";
+    document.getElementById("placeholder").style.display = "block";
+    _updateBadge();
+  }
+
+  async function deleteRegistration() {
+    if (!lastRegisteredInfo) return;
+    document.getElementById("btn-reg-delete").disabled = true;
+
+    const { type, name } = lastRegisteredInfo;
+    const endpoint = type === "model" ? "models" : "states";
+
+    try {
+      const res = await fetch(`/api/registry/${endpoint}/${name}`, { method: "DELETE" });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        addBubble("Failed to delete: " + (err.detail || res.statusText), "info");
+        document.getElementById("btn-reg-delete").disabled = false;
+        return;
+      }
+      addBubble(`${type === "model" ? "Model" : "State"} "${name}" deleted from registry.`, "info");
+      dismissRegistryCard();
+    } catch (e) {
+      addBubble("Network error: " + e.message, "info");
+      document.getElementById("btn-reg-delete").disabled = false;
+    }
   }
 
   // ── Observable card ────────────────────────────────────────────────────────
@@ -700,6 +963,7 @@
     document.getElementById("config-card").style.display = "none";
     document.getElementById("obs-results-card").style.display = "none";
     document.getElementById("obs-card").style.display = "block";
+    openDrawer(); _updateBadge();
     document.getElementById("obs-summary-text").textContent = obsSummary || "Review the observable config below.";
 
     const display = document.getElementById("obs-config-display");
@@ -721,11 +985,49 @@
     document.getElementById("obs-card").style.display = "none";
     document.getElementById("placeholder").style.display = "block";
     addBubble("Observable cancelled. Let me know what you'd like to change.", "info");
+    _updateBadge();
   }
 
   function dismissObsResults() {
     document.getElementById("obs-results-card").style.display = "none";
     document.getElementById("placeholder").style.display = "block";
+    currentObsRunId = null;
+    currentObsData = null;
+    _updateBadge();
+  }
+
+  function downloadObsPlot() {
+    const container = document.getElementById("obs-plot-container");
+    const filename = currentObsRunId ? `${currentObsRunId}_plot` : "observable_plot";
+    Plotly.downloadImage(container, { format: "png", filename, width: 900, height: 500 });
+  }
+
+  function downloadObsMetadata() {
+    if (!currentObsData || !currentObsRunId) return;
+    const { obs_run_id, sim_run_id, algorithm, observable_type, observable_params,
+            config, status, sweeps_processed, metadata } = currentObsData;
+    const meta = { obs_run_id, sim_run_id, algorithm, observable_type,
+                   observable_params, config, status, sweeps_processed, metadata };
+    const blob = new Blob([JSON.stringify(meta, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${currentObsRunId}_metadata.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function downloadObsNumpy() {
+    if (!currentObsRunId) return;
+    const resp = await fetch(`/api/obs_results/${currentObsRunId}/numpy`);
+    if (!resp.ok) { alert("Failed to generate numpy download."); return; }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${currentObsRunId}.npz`;
+    a.click();
+    URL.revokeObjectURL(url);
   }
 
   async function confirmObsRun() {
@@ -795,7 +1097,7 @@
         }
       } catch (_) { /* keep trying */ }
       finally { polling = false; }
-    }, 2000);
+    }, 5000);
   }
 
   async function fetchAndRenderObsResults(obsRunId) {
@@ -806,13 +1108,26 @@
         return;
       }
       const data = await res.json();
+      currentObsRunId = obsRunId;
+      currentObsData = data;
 
       document.getElementById("status-card").style.display = "none";
       document.getElementById("obs-results-card").style.display = "block";
       document.getElementById("placeholder").style.display = "none";
+      openDrawer(); _updateBadge();
 
       const obsType = data.metadata?.observable_type || currentObsConfig?.observable_type || "Observable";
       document.getElementById("obs-results-header").textContent = `Results: ${obsType}`;
+
+      // Show params used so the user can spot bad values (e.g. boundary bond)
+      const paramsEl = document.getElementById("obs-results-params");
+      const params = data.metadata?.params || {};
+      if (paramsEl) {
+        const entries = Object.entries(params);
+        paramsEl.textContent = entries.length > 0
+          ? entries.map(([k, v]) => `${k}: ${v}`).join("  |  ")
+          : "";
+      }
 
       renderObsPlot(data, obsType);
       renderObsAnalysis(data, obsType);
@@ -934,11 +1249,25 @@
 
     if (!nums) { box.style.display = "none"; return; }
 
-    const min  = Math.min(...nums).toFixed(6);
-    const max  = Math.max(...nums).toFixed(6);
-    const mean = (nums.reduce((a, b) => a + b, 0) / nums.length).toFixed(6);
-    const std  = Math.sqrt(nums.map(v => (v - mean) ** 2).reduce((a, b) => a + b, 0) / nums.length).toFixed(6);
-    const last = nums[nums.length - 1].toFixed(6);
+    const fmtStat = v => {
+      if (!isFinite(v)) return String(v);
+      const abs = Math.abs(v);
+      if (abs === 0) return "0";
+      if (abs < 1e-3 || abs >= 1e6) return v.toExponential(4);
+      return v.toPrecision(6);
+    };
+
+    const minVal  = Math.min(...nums);
+    const maxVal  = Math.max(...nums);
+    const meanVal = nums.reduce((a, b) => a + b, 0) / nums.length;
+    const stdVal  = Math.sqrt(nums.map(v => (v - meanVal) ** 2).reduce((a, b) => a + b, 0) / nums.length);
+    const lastVal = nums[nums.length - 1];
+
+    const min  = fmtStat(minVal);
+    const max  = fmtStat(maxVal);
+    const mean = fmtStat(meanVal);
+    const std  = fmtStat(stdVal);
+    const last = fmtStat(lastVal);
 
     const trend = nums.length > 1
       ? (nums[nums.length - 1] > nums[0] ? "increasing" : nums[nums.length - 1] < nums[0] ? "decreasing" : "flat")
@@ -1050,6 +1379,34 @@
       document.getElementById("msg-input").focus();
     }
   }
+  // Pending config to push to the builder once the iframe loads
+  let _pendingBuilderConfig = null;
+
+  // Push config into the iframe — never force-loads the iframe to avoid
+  // competing with the Julia pipeline server during simulation startup
+  function _pushConfigToBuilder(config, summary) {
+    const frame = document.getElementById("config-builder-frame");
+    const msg = { type: "tn_load_config", config, summary: summary || "" };
+    if (!frame.src || frame.src === window.location.href) {
+      // Iframe not loaded yet — store and send when it naturally loads
+      _pendingBuilderConfig = msg;
+    } else if (frame.contentWindow) {
+      frame.contentWindow.postMessage(msg, "*");
+    }
+  }
+
+  // Receive configs sent from the config builder iframe via "Send to Chat"
+  window.addEventListener("message", function(e) {
+    if (!e.data || e.data.type !== "tn_config_ready") return;
+    currentConfig = e.data.config;
+    lastSubmittedConfig = e.data.config;
+    // Clear all existing cards so the new config card is the only thing showing
+    document.getElementById("obs-card").style.display = "none";
+    document.getElementById("obs-results-card").style.display = "none";
+    document.getElementById("registry-card").style.display = "none";
+    document.getElementById("status-card").style.display = "none";
+    showConfigCard(e.data.config, e.data.summary || "Config from builder");
+  });
 </script>
 </body>
 </html>

@@ -27,14 +27,20 @@ from pathlib import Path
 import boto3
 from dotenv import load_dotenv
 load_dotenv()
+import io
+
 import httpx
+import numpy as np
 import yaml
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from chatbot.registry_loader import load_all as _load_registries
 from chatbot.prompt_builder import build_system_prompt
+from chatbot.observable_loader import find_obs_run_dir, load_obs_run, list_obs_runs
+
+OBS_BASE_DIR = str(Path(__file__).parent.parent / "data_obs")
 
 # Path to the simulation run catalog
 CATALOG_PATH = Path(__file__).parent.parent / "data" / "run_catalog.jsonl"
@@ -123,9 +129,11 @@ SUBMIT_CONFIG_TOOL = {
     "name": "submit_config",
     "description": (
         "Call this ONLY when you have gathered all required information and are "
-        "ready to propose a complete, valid ED simulation config to the user. "
-        "Do not call for partial configs. The config will be shown to the user "
-        "for review before running."
+        "ready to propose a complete, valid simulation config to the user. "
+        "Do not call for partial configs. "
+        "Set auto_run to true ONLY when the user has clearly confirmed they want to "
+        "execute immediately (e.g. 'run it', 'go ahead', 'I\\'m ready', 'yes execute it'). "
+        "Leave auto_run false (default) when proposing a config for the user to review first."
     ),
     "inputSchema": {
         "json": {
@@ -146,6 +154,14 @@ SUBMIT_CONFIG_TOOL = {
                 "summary": {
                     "type": "string",
                     "description": "One plain-English sentence describing what this simulation does",
+                },
+                "auto_run": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, execute the simulation immediately without waiting for "
+                        "the user to click Confirm. Only set true when the user explicitly "
+                        "says to run now (e.g. 'run it', 'go ahead', 'I\\'m ready')."
+                    ),
                 },
             },
             "required": ["config", "summary"],
@@ -214,7 +230,9 @@ CALCULATE_OBSERVABLE_TOOL = {
     "description": (
         "Call this when the user wants to compute or analyze an observable on a past simulation run. "
         "Use query_catalog first to find the run_id if not already known. "
-        "The config will be shown to the user for review before submitting."
+        "Set auto_run to true ONLY when the user has clearly confirmed they want to calculate immediately "
+        "(e.g. 'run it', 'go ahead', 'yes calculate it'). "
+        "Leave auto_run false (default) to show the config for review first."
     ),
     "inputSchema": {
         "json": {
@@ -239,10 +257,20 @@ CALCULATE_OBSERVABLE_TOOL = {
                     "description": (
                         "Observable parameters. Required keys by type: "
                         "single_site_expectation: {site, operator}. "
+                        "expectation_all_sites: {operator}. "
+                        "subsystem_expectation_sum: {operator, l, m} — l and m are 1-based start/end site indices of the subsystem (both required). "
                         "correlation_function: {site_i, site_j, operator} — SAME operator at both sites (e.g. ZZ, XX). "
                         "connected_correlation: {site_i, site_j, operator} — same as correlation_function but subtracted. "
                         "two_site_expectation: {site_i, site_j, operator_i, operator_j} — DIFFERENT operators at each site (e.g. XZ). "
-                        "entanglement_entropy: {bond}. energy_expectation: {}. "
+                        "correlation_matrix: {operator}. "
+                        "entanglement_entropy: {bond, alpha} — alpha optional, default 1 (von Neumann). "
+                        "entanglement_spectrum: {bond, n_values} — n_values optional. "
+                        "energy_expectation: {}. energy_variance: {}. "
+                        "inner_product: {}. state_norm: {}. "
+                        "fidelity: {reference} — reference is 'initial' or 'ground_state'. "
+                        "survival_probability: {}. loschmidt_echo: {}. "
+                        "boson_number: {}. boson_distribution: {}. boson_field: {}. "
+                        "boson_spin_entanglement: {alpha} — alpha optional, default 1. "
                         "IMPORTANT: use correlation_function (not two_site_expectation) when the user asks for "
                         "spin-spin correlation, ZZ/XX/YY correlation, or any same-operator two-point function. "
                         "Only use two_site_expectation when user explicitly wants two DIFFERENT operators. "
@@ -258,8 +286,114 @@ CALCULATE_OBSERVABLE_TOOL = {
                     "type": "string",
                     "description": "One plain-English sentence describing what this observable calculation will compute.",
                 },
+                "auto_run": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, execute the observable calculation immediately without waiting "
+                        "for the user to click Confirm. Only set true when the user explicitly "
+                        "says to calculate now."
+                    ),
+                },
             },
             "required": ["run_id", "observable_type", "params", "summary"],
+        }
+    },
+}
+
+REGISTER_MODEL_TOOL = {
+    "name": "register_model",
+    "description": (
+        "Call this ONLY when the user explicitly asks to register, save, or add a new custom model "
+        "to the registry. Gather ALL required fields through conversation first, then call this tool. "
+        "Do NOT call this during simulation setup, observable calculations, or catalog queries."
+    ),
+    "inputSchema": {
+        "json": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Unique identifier key for the model (lowercase, underscores, e.g. my_ising_model)",
+                },
+                "display_name": {
+                    "type": "string",
+                    "description": "Human-readable label shown in the GUI (e.g. My Ising Model)",
+                },
+                "system_type": {
+                    "type": "string",
+                    "description": "System type: 'spin' or 'spinboson'",
+                },
+                "backend": {
+                    "type": "string",
+                    "description": "Simulation backend: 'tn' (tensor networks, DMRG/TDVP) or 'ed' (exact diagonalization)",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional plain-English description of what this model represents",
+                },
+                "channels": {
+                    "type": "array",
+                    "description": (
+                        "Required when backend='tn'. Array of channel objects defining the Hamiltonian. "
+                        "Each object is one of: "
+                        "{\"type\": \"FiniteRangeCoupling\", \"op1\": \"Z\", \"op2\": \"Z\", \"range\": 1, \"strength\": 1.0} "
+                        "or {\"type\": \"Field\", \"op\": \"X\", \"strength\": 0.5}"
+                    ),
+                },
+                "terms": {
+                    "type": "array",
+                    "description": (
+                        "Required when backend='ed'. Array of term objects defining the Hamiltonian. "
+                        "Same format as channels: FiniteRangeCoupling or Field objects."
+                    ),
+                },
+            },
+            "required": ["name", "display_name", "system_type", "backend"],
+        }
+    },
+}
+
+REGISTER_STATE_TOOL = {
+    "name": "register_state",
+    "description": (
+        "Call this ONLY when the user explicitly asks to register, save, or add a new custom state "
+        "to the registry. Gather ALL required fields through conversation first, then call this tool. "
+        "Do NOT call this during simulation setup, observable calculations, or catalog queries."
+    ),
+    "inputSchema": {
+        "json": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Unique identifier key for the state (lowercase, underscores, e.g. my_neel_state)",
+                },
+                "display_name": {
+                    "type": "string",
+                    "description": "Human-readable label shown in the GUI (e.g. My Neel State)",
+                },
+                "system_type": {
+                    "type": "string",
+                    "description": "System type: 'spin' or 'spinboson'",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional plain-English description of what this state represents physically",
+                },
+                "site_configs": {
+                    "type": "array",
+                    "description": (
+                        "Array of N entries (one per spin site), each a [direction, eigenstate] pair. "
+                        "direction: 'X', 'Y', or 'Z'. eigenstate: integer (for spin-1/2 Z: 1=down, 2=up). "
+                        "Example for 4-site Neel: [[\"Z\",2],[\"Z\",1],[\"Z\",2],[\"Z\",1]]"
+                    ),
+                },
+                "boson_level": {
+                    "type": "integer",
+                    "description": "Spinboson systems only. Initial Fock occupation of the boson site (0=vacuum).",
+                },
+            },
+            "required": ["name", "display_name", "system_type", "site_configs"],
         }
     },
 }
@@ -325,15 +459,62 @@ _OBSERVABLE_TRIGGER_WORDS = {
     # display intent (unambiguous — not used for simulation setup)
     "plot", "show", "display", "view", "visualize",
     # specific observable names (never appear in simulation setup)
-    "observable", "entanglement", "magnetization", "correlation", "entropy",
-    "expectation value", "energy variance", "boson number", "boson distribution",
+    "observable", "observation",
+    "entanglement", "magnetization", "correlation", "entropy",
+    "expectation", "expectation value", "energy variance", "boson number", "boson distribution",
     "boson field", "spin entanglement", "correlation matrix", "correlation function",
-    "single site", "all sites",
+    "single site", "all sites", "subsystem",
 }
 
 def _user_requested_observable(message: str) -> bool:
     msg = message.lower()
     return any(w in msg for w in _OBSERVABLE_TRIGGER_WORDS)
+
+
+_REGISTRY_TRIGGER_WORDS = {
+    "register", "register model", "register state",
+    "add a model", "add a state", "add model", "add state",
+    "save a model", "save a state", "new user model", "new user state",
+}
+
+def _user_requested_registration(message: str, history: list | None = None) -> bool:
+    # Check current message first
+    if any(w in message.lower() for w in _REGISTRY_TRIGGER_WORDS):
+        return True
+    # Also scan recent conversation history — the trigger may have been in an earlier turn
+    if history:
+        for turn in history[-20:]:
+            for block in turn.get("content", []):
+                text = block.get("text", "")
+                if isinstance(text, str) and any(w in text.lower() for w in _REGISTRY_TRIGGER_WORDS):
+                    return True
+    return False
+
+
+def _refresh_system_prompt() -> None:
+    """Reload registries from the Julia server and rebuild the system prompt in-memory."""
+    global _registries, SYSTEM_PROMPT
+    try:
+        _registries = _load_registries()
+        SYSTEM_PROMPT = build_system_prompt(_registries, _keywords)
+    except Exception:
+        pass  # keep the existing prompt if the reload fails
+
+
+async def _execute_registration(tool_name: str, inputs: dict) -> str:
+    """POST to the Julia server's registry endpoint and return a result string for Claude."""
+    endpoint = "models" if tool_name == "register_model" else "states"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            r = await client.post(f"{JULIA_URL}/api/registry/{endpoint}", json=inputs)
+            if r.status_code == 201:
+                _refresh_system_prompt()
+                return r.json().get("message", "Registered successfully.")
+            return f"Registration failed ({r.status_code}): {r.text}"
+        except httpx.ConnectError:
+            return "Cannot reach Julia pipeline server at port 8080. Make sure it is running."
+        except httpx.ReadTimeout:
+            return "Julia server took too long to respond. The model may have been registered — check with 'what models can you use?' before trying again."
 
 
 @app.post("/api/chat")
@@ -360,6 +541,8 @@ async def chat(req: ChatRequest):
                 {"toolSpec": CALCULATE_OBSERVABLE_TOOL},
                 {"toolSpec": QUERY_OBS_CATALOG_TOOL},
                 {"toolSpec": SHOW_OBSERVABLE_RESULTS_TOOL},
+                {"toolSpec": REGISTER_MODEL_TOOL},
+                {"toolSpec": REGISTER_STATE_TOOL},
             ]},
             inferenceConfig={"maxTokens": 2048, "temperature": 0.5},
         )
@@ -370,8 +553,9 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=502, detail=f"Bedrock error: {e}")
 
     # Tool execution loop: handle executable tools before final response parsing.
-    EXECUTABLE_TOOLS = {"query_catalog", "query_obs_catalog"}
+    EXECUTABLE_TOOLS = {"query_catalog", "query_obs_catalog", "register_model", "register_state"}
     MAX_TOOL_ROUNDS = 5
+    registered_info = None
     for _ in range(MAX_TOOL_ROUNDS):
         content = response["output"]["message"]["content"]
 
@@ -391,12 +575,25 @@ async def chat(req: ChatRequest):
                 json.dumps(results, indent=2)
                 if results else "No matching runs found in the catalog."
             )
-        else:  # query_obs_catalog
+        elif exec_tool["name"] == "query_obs_catalog":
             results = await _read_obs_catalog(exec_tool["input"])
             result_text = (
                 json.dumps(results, indent=2)
                 if results else "No matching observable calculations found in the catalog."
             )
+        else:  # register_model or register_state
+            if not _user_requested_registration(req.message, history):
+                result_text = "No explicit registration request detected; call ignored."
+            else:
+                result_text = await _execute_registration(exec_tool["name"], exec_tool["input"])
+                if not result_text.startswith("Registration failed") and not result_text.startswith("Cannot reach"):
+                    registered_info = {
+                        "type": "model" if exec_tool["name"] == "register_model" else "state",
+                        "name": exec_tool["input"].get("name"),
+                        "display_name": exec_tool["input"].get("display_name"),
+                        "system_type": exec_tool["input"].get("system_type"),
+                        "backend": exec_tool["input"].get("backend"),
+                    }
 
         history.append({
             "role": "user",
@@ -422,6 +619,8 @@ async def chat(req: ChatRequest):
     obs_summary = ""
     show_obs_run_id = None
     show_obs_summary = ""
+    tracking_id = None
+    obs_tracking_id = None
 
     # extracts user response if it is text or a config file
     for block in content:
@@ -454,7 +653,8 @@ async def chat(req: ChatRequest):
                 })
         elif "toolUse" in block and block["toolUse"]["name"] == "calculate_observable":
             tool = block["toolUse"]
-            if _user_requested_observable(req.message):
+            obs_auto_run_check = tool["input"].get("auto_run", False)
+            if _user_requested_observable(req.message) or obs_auto_run_check:
                 obs_config = {
                     "run_id": tool["input"].get("run_id"),
                     "observable_type": tool["input"].get("observable_type"),
@@ -462,19 +662,46 @@ async def chat(req: ChatRequest):
                     "selection": tool["input"].get("selection", "all"),
                 }
                 obs_summary = tool["input"].get("summary", "")
+
+                obs_auto_run = obs_auto_run_check
+                if obs_auto_run:
+                    try:
+                        julia_payload = {
+                            "run_id": obs_config["run_id"],
+                            "observable": {
+                                "type": obs_config["observable_type"],
+                                "params": obs_config["params"],
+                            },
+                            "selection": {"selection": obs_config["selection"]},
+                        }
+                        async with httpx.AsyncClient(timeout=60.0) as client:
+                            r = await client.post(
+                                f"{JULIA_URL}/api/observables/calculate",
+                                json=julia_payload,
+                            )
+                        if r.status_code in (200, 202):
+                            obs_tracking_id = r.json().get("tracking_id")
+                    except (httpx.ConnectError, httpx.ReadTimeout):
+                        obs_tracking_id = None
+
+                tool_result_text = "Observable calculation started." if (obs_auto_run and obs_tracking_id) else "Observable config shown to user for review."
                 history.append({
                     "role": "user",
                     "content": [{"toolResult": {
                         "toolUseId": tool["toolUseId"],
-                        "content": [{"text": "Observable config shown to user for review."}],
+                        "content": [{"text": tool_result_text}],
                     }}],
                 })
-                ack = (
-                    reply_text
-                    or "I've prepared the observable calculation config. "
-                       "Review it on the right and click Confirm to calculate, "
-                       "or let me know what you'd like to change."
-                )
+                if obs_auto_run and obs_tracking_id:
+                    ack = reply_text or f"Calculating now — {obs_summary}"
+                    obs_config = None  # don't show the confirm card
+                else:
+                    ack = (
+                        reply_text
+                        or "I've prepared the observable calculation config. "
+                           "Review it on the right and click Confirm to calculate, "
+                           "or let me know what you'd like to change."
+                    )
                 history.append({"role": "assistant", "content": [{"text": ack}]})
                 reply_text = ack
             else:
@@ -506,36 +733,66 @@ async def chat(req: ChatRequest):
                     model_params.pop("N", None)
             SESSIONS[sid]["last_config"] = proposed_config
 
+            # If auto_run is set, fire the simulation directly without waiting for button click
+            auto_run = tool["input"].get("auto_run", False)
+            tracking_id = None
+
+            if auto_run and proposed_config:
+                try:
+                    async with httpx.AsyncClient(timeout=60.0) as client:
+                        r = await client.post(
+                            f"{JULIA_URL}/api/run",
+                            json={"config": proposed_config, "mode": "simulation"},
+                        )
+                    if r.status_code in (200, 202):
+                        tracking_id = r.json().get("tracking_id")
+                except (httpx.ConnectError, httpx.ReadTimeout):
+                    pass  # Julia down or slow — fall through, frontend shows confirm card as fallback
+
             # Append tool result so the next user turn stays valid
             # Bedrock requires every toolUse to get a toolResult appended to history
             # or next API call will result in validation errors, so this takes care of it
+            tool_result_text = "Simulation started." if tracking_id else "Config shown to user for review."
             history.append({
                 "role": "user",
                 "content": [{"toolResult": {
                     "toolUseId": tool["toolUseId"],
-                    "content": [{"text": "Config shown to user for review."}],
+                    "content": [{"text": tool_result_text}],
                 }}],
             })
             # Synthetic assistant acknowledgment keeps conversation history valid
             # Bedrock expects the next turn to be the model so keep a flowing conversation
-            ack = (
-                reply_text
-                or "I've prepared your simulation config. "
-                   "Review it on the right and click Confirm to run, "
-                   "or let me know what you'd like to change."
-            )
+            if tracking_id:
+                ack = reply_text or f"Running now — {summary}"
+            elif auto_run:
+                # auto_run was requested but Julia didn't accept in time — show confirm card as fallback
+                ack = (
+                    reply_text
+                    or "Julia took a moment to respond, so the config is ready for you to confirm manually. "
+                       "Click Confirm & Run on the right when ready."
+                )
+            else:
+                ack = (
+                    reply_text
+                    or "I've prepared your simulation config. "
+                       "Review it on the right and click Confirm to run, "
+                       "or let me know what you'd like to change."
+                )
             history.append({"role": "assistant", "content": [{"text": ack}]})
             reply_text = ack
 
     return {
         "session_id": sid,
         "text": reply_text,
-        "config": proposed_config,
+        "config": proposed_config if not tracking_id else None,
         "summary": summary,
+        "tracking_id": tracking_id,
         "obs_config": obs_config,
         "obs_summary": obs_summary,
+        "obs_tracking_id": obs_tracking_id,
         "show_obs_run_id": show_obs_run_id,
         "show_obs_summary": show_obs_summary,
+        "registered": registered_info,
     }
 
 
@@ -617,26 +874,117 @@ async def start_obs_calculation(req: ObsRequest):
         return r.json()
 
 
-@app.get("/api/obs_results/{obs_run_id}")
-async def get_obs_results(obs_run_id: str):
-    """Fetch observable results from the Julia pipeline server."""
-    async with httpx.AsyncClient(timeout=15.0) as client:
+@app.delete("/api/registry/models/{name}")
+async def delete_registry_model(name: str):
+    """Proxy a model deletion to the Julia pipeline server."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            r = await client.get(f"{JULIA_URL}/api/results/observables/{obs_run_id}")
+            r = await client.delete(f"{JULIA_URL}/api/registry/models/{name}")
         except httpx.ConnectError:
             raise HTTPException(status_code=503, detail="Julia pipeline server unreachable")
-        if r.status_code == 404:
-            raise HTTPException(status_code=404, detail="Observable results not found.")
+        if r.status_code not in (200, 204):
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        _refresh_system_prompt()
         return r.json()
+
+
+@app.delete("/api/registry/states/{name}")
+async def delete_registry_state(name: str):
+    """Proxy a state deletion to the Julia pipeline server."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            r = await client.delete(f"{JULIA_URL}/api/registry/states/{name}")
+        except httpx.ConnectError:
+            raise HTTPException(status_code=503, detail="Julia pipeline server unreachable")
+        if r.status_code not in (200, 204):
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        _refresh_system_prompt()
+        return r.json()
+
+
+@app.get("/api/obs_results/{obs_run_id}")
+async def get_obs_results(obs_run_id: str):
+    """Fetch observable results: tries Julia server first, falls back to local disk loader."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(f"{JULIA_URL}/api/results/observables/{obs_run_id}")
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 404:
+                raise HTTPException(status_code=404, detail="Observable results not found.")
+    except httpx.ConnectError:
+        pass  # Julia not running — fall through to local loader
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # Other Julia errors — try local
+
+    try:
+        obs_run_dir = find_obs_run_dir(OBS_BASE_DIR, obs_run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    result = await asyncio.to_thread(load_obs_run, obs_run_dir)
+    return result
+
+
+@app.get("/api/local/obs_data/{obs_run_id}")
+async def get_local_obs_data(obs_run_id: str):
+    """Read observable results directly from disk (no Julia dependency).
+    Returns the same JSON shape as /api/obs_results/.
+    """
+    try:
+        obs_run_dir = find_obs_run_dir(OBS_BASE_DIR, obs_run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    result = await asyncio.to_thread(load_obs_run, obs_run_dir)
+    return result
+
+
+@app.get("/api/obs_results/{obs_run_id}/numpy")
+async def download_obs_numpy(obs_run_id: str):
+    """Return sweep numerical data as a compressed .npz file."""
+    try:
+        obs_run_dir = find_obs_run_dir(OBS_BASE_DIR, obs_run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    result = await asyncio.to_thread(load_obs_run, obs_run_dir)
+    data = result.get("data", {})
+
+    arrays = {}
+    for key in ("indices", "energies", "bond_dims", "times"):
+        if data.get(key):
+            arrays[key] = np.array(data[key])
+
+    if data.get("values"):
+        try:
+            arrays["values"] = np.array(data["values"])
+        except ValueError:
+            arrays["values"] = np.array(data["values"], dtype=object)
+
+    buf = io.BytesIO()
+    np.savez_compressed(buf, **arrays)
+    buf.seek(0)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{obs_run_id}.npz"'},
+    )
 
 
 # checks status of the run to see if the endpoint is done yet
 @app.get("/api/status/{tracking_id}")
 async def poll_status(tracking_id: str):
     """Proxy a status poll to the Julia pipeline server."""
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=120.0) as client:
         try:
             r = await client.get(f"{JULIA_URL}/api/status/{tracking_id}")
         except httpx.ConnectError:
             raise HTTPException(status_code=503, detail="Julia pipeline server unreachable")
+        except httpx.ReadTimeout:
+            # Julia server is under load from the running simulation — treat as still running
+            return {"status": "running", "tracking_id": tracking_id, "message": "Server busy; simulation still in progress."}
         return r.json()
