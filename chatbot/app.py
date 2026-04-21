@@ -27,10 +27,13 @@ from pathlib import Path
 import boto3
 from dotenv import load_dotenv
 load_dotenv()
+import io
+
 import httpx
+import numpy as np
 import yaml
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from chatbot.registry_loader import load_all as _load_registries
@@ -452,6 +455,17 @@ def index():
 # Deliberately excludes "calculate" and "compute" — those also appear in simulation requests
 # (e.g. "calculate the ground state with DMRG") and would cause false positives.
 # The LLM handles that distinction; this guard is only a safety net for rogue tool calls.
+_CATALOG_TRIGGER_WORDS = {
+    "existing", "previous", "past", "history", "catalog",
+    "already", "have run", "been calculated", "been computed",
+    "show", "plot", "display", "view", "list", "find", "search",
+}
+
+def _user_wants_catalog_lookup(message: str) -> bool:
+    msg = message.lower()
+    return any(w in msg for w in _CATALOG_TRIGGER_WORDS)
+
+
 _OBSERVABLE_TRIGGER_WORDS = {
     # display intent (unambiguous — not used for simulation setup)
     "plot", "show", "display", "view", "visualize",
@@ -524,6 +538,27 @@ async def chat(req: ChatRequest):
 
     # Append user turn (Bedrock format)
     history.append({"role": "user", "content": [{"text": req.message}]})
+
+    # Pre-fetch catalog data when the user asks about existing runs or observables.
+    # Haiku does not reliably call query_catalog/query_obs_catalog on its own, so we
+    # inject the results directly into the message context before the Bedrock call.
+    if _user_wants_catalog_lookup(req.message):
+        sim_results = _read_catalog({"limit": 10})
+        obs_results = await _read_obs_catalog({"limit": 10})
+        context_parts = []
+        if sim_results:
+            context_parts.append(
+                "<simulation_catalog>\n" + json.dumps(sim_results, indent=2) + "\n</simulation_catalog>"
+            )
+        if obs_results:
+            context_parts.append(
+                "<observable_catalog>\n" + json.dumps(obs_results, indent=2) + "\n</observable_catalog>"
+            )
+        if context_parts:
+            catalog_block = "\n\n".join(context_parts)
+            history[-1]["content"][0]["text"] = (
+                f"[Pre-fetched catalog data for this request:]\n{catalog_block}\n\n[User]: {req.message}"
+            )
 
     # Call Bedrock in a thread so we don't block the event loop
     # tells Bedrock what tools are available to LLM
@@ -663,10 +698,18 @@ async def chat(req: ChatRequest):
                 obs_auto_run = obs_auto_run_check
                 if obs_auto_run:
                     try:
+                        julia_payload = {
+                            "run_id": obs_config["run_id"],
+                            "observable": {
+                                "type": obs_config["observable_type"],
+                                "params": obs_config["params"],
+                            },
+                            "selection": {"selection": obs_config["selection"]},
+                        }
                         async with httpx.AsyncClient(timeout=60.0) as client:
                             r = await client.post(
                                 f"{JULIA_URL}/api/observables/calculate",
-                                json=obs_config,
+                                json=julia_payload,
                             )
                         if r.status_code in (200, 202):
                             obs_tracking_id = r.json().get("tracking_id")
@@ -929,6 +972,39 @@ async def get_local_obs_data(obs_run_id: str):
 
     result = await asyncio.to_thread(load_obs_run, obs_run_dir)
     return result
+
+
+@app.get("/api/obs_results/{obs_run_id}/numpy")
+async def download_obs_numpy(obs_run_id: str):
+    """Return sweep numerical data as a compressed .npz file."""
+    try:
+        obs_run_dir = find_obs_run_dir(OBS_BASE_DIR, obs_run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    result = await asyncio.to_thread(load_obs_run, obs_run_dir)
+    data = result.get("data", {})
+
+    arrays = {}
+    for key in ("indices", "energies", "bond_dims", "times"):
+        if data.get(key):
+            arrays[key] = np.array(data[key])
+
+    if data.get("values"):
+        try:
+            arrays["values"] = np.array(data["values"])
+        except ValueError:
+            arrays["values"] = np.array(data["values"], dtype=object)
+
+    buf = io.BytesIO()
+    np.savez_compressed(buf, **arrays)
+    buf.seek(0)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{obs_run_id}.npz"'},
+    )
 
 
 # checks status of the run to see if the endpoint is done yet
